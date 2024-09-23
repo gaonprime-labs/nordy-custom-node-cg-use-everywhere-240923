@@ -37,10 +37,10 @@ const nodeHandler = {
         const result = Reflect.set(...arguments);
         if (oldValue!=value) {
             if (property==='bgcolor') {
-                if (obj.mode!=4) linkRenderController.mark_link_list_outdated();
+                if (obj.mode!=4) linkRenderController?.mark_link_list_outdated();
             }
             if (property==='mode') {
-                linkRenderController.mark_link_list_outdated();
+                linkRenderController?.mark_link_list_outdated();
                 obj.widgets?.forEach((widget) => {widget.onModeChange?.(value)});
             }
         }
@@ -69,7 +69,7 @@ app.registerExtension({
                     update_input_label(this, slot, app);
                 }
             }
-            linkRenderController.mark_link_list_outdated();
+            linkRenderController?.mark_link_list_outdated();
             onConnectionsChange?.apply(this, arguments);
         };
 
@@ -133,7 +133,7 @@ app.registerExtension({
         inject_outdating_into_object_method(node, 'onRemoved', `node ${node.id} removed`)
 
         // creating a node makes the link list dirty - but give the system a moment to finish
-        setTimeout( ()=>{linkRenderController.mark_link_list_outdated()}, 100 );
+        setTimeout( ()=>{linkRenderController?.mark_link_list_outdated()}, 100 );
     }, 
 
     loadedGraphNode(node) { if (node.flags.collapsed && node.loaded_when_collapsed) node.loaded_when_collapsed(); },
