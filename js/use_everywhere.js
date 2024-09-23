@@ -165,17 +165,21 @@ app.registerExtension({
         /*
         We don't want to do that if we are saving the workflow or api:
         */
-        const _original_save_onclick = document.getElementById('comfy-save-button').onclick;
-        document.getElementById('comfy-save-button').onclick = function() {
-            graphAnalyser.pause();
-            _original_save_onclick();
-            graphAnalyser.unpause()
-        }
-        const _original_save_api_onclick = document.getElementById('comfy-dev-save-api-button').onclick;
-        document.getElementById('comfy-dev-save-api-button').onclick = function() {
-            graphAnalyser.pause();
-            _original_save_api_onclick();
-            graphAnalyser.unpause();
+       try{
+           const _original_save_onclick = document.getElementById('comfy-save-button').onclick;
+           document.getElementById('comfy-save-button').onclick = function() {
+               graphAnalyser.pause();
+               _original_save_onclick();
+               graphAnalyser.unpause()
+            }
+            const _original_save_api_onclick = document.getElementById('comfy-dev-save-api-button').onclick;
+            document.getElementById('comfy-dev-save-api-button').onclick = function() {
+                graphAnalyser.pause();
+                _original_save_api_onclick();
+                graphAnalyser.unpause();
+            }
+        }catch(e){
+            console.log("[nordy-custom-node] Couldn't find save buttons")
         }
         
         /* 
