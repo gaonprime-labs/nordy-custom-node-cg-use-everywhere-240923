@@ -143,7 +143,7 @@ app.registerExtension({
         const link = document.createElement('link');
         link.rel = 'stylesheet';
         link.type = 'text/css';
-        link.href = 'extensions/cg-use-everywhere/ue.css';
+        link.href = `${window.COMFY_API_URL}/extensions/nordy-custom-node-cg-use-everywhere-240923/ue.css`;
         head.appendChild(link);
 
         /*
