@@ -1,26 +1,60 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
-import { is_UEnode, is_helper, inject, Logger, get_real_node, defineProperty } from "./use_everywhere_utilities.js";
-import { displayMessage, update_input_label, indicate_restriction, UpdateBlocker } from "./use_everywhere_ui.js";
-import { LinkRenderController } from "./use_everywhere_ui.js";
-import { autoCreateMenu } from "./use_everywhere_autocreate.js";
-import { add_autoprompts } from "./use_everywhere_autoprompt.js";
+import { shared, deferred_actions } from "./shared.js";
+
+import { is_UEnode, inject, Logger, graphConverter, create, node_can_broadcast } from "./use_everywhere_utilities.js";
+import { title_bar_additions, LinkRenderController } from "./use_everywhere_ui.js";
 import { GraphAnalyser } from "./use_everywhere_graph_analysis.js";
-import { main_menu_settings, node_menu_settings, canvas_menu_settings, non_ue_menu_settings } from "./use_everywhere_settings.js";
-import { add_debug } from "./ue_debug.js";
+import { canvas_menu_settings, SETTINGS, add_extra_menu_items } from "./use_everywhere_settings.js";
+import { settingsCache } from "./use_everywhere_cache.js";
+import { convert_to_links } from "./use_everywhere_apply.js";
+import { visible_graph, fix_new_subgraph_node } from "./use_everywhere_subgraph_utils.js";
+import { setup_ue_properties_oncreate, setup_ue_properties_onload } from "./ue_properties.js";
+import { edit_restrictions } from "./ue_properties_editor.js";
+import { language_changed } from "./i18n.js";
+import { input_changed, fix_inputs } from "./connections.js";
+import { comboclone_on_connection, is_combo_clone } from "./combo_clone.js";
+import { ue_callbacks } from "./recursive_callbacks.js";
 
 /*
-The ui component that looks after the link rendering
+All nodes need the onDrawTitleBar method so they can show if they are broadcasting UE data.
 */
-var linkRenderController;
-var graphAnalyser;
+function add_methods_to_all_nodes(node) {
+    if (node.ue_methods_added) return Logger.log_problem(`Node ${node.id} already has UE methods added`);
+
+    try {
+        add_extra_menu_items(node, inject_outdating_into_object_method) // right click menu additions
+        
+        const original_onDrawTitleBar = node.onDrawTitleBar;
+        node.onDrawTitleBar = function(ctx, title_height) {
+            original_onDrawTitleBar?.apply(this, arguments);
+            title_bar_additions(node, ctx, title_height)
+        }
+
+        const original_onMouseEnter = node.onMouseEnter;
+        node.onMouseEnter = function(e) {
+            original_onMouseEnter?.apply(this, arguments)
+            shared.linkRenderController.node_over_changed()
+        }
+
+        const original_onMouseLeave = node.onMouseLeave;
+        node.onMouseLeave = function(e) {
+            original_onMouseLeave?.apply(this, arguments)
+            shared.linkRenderController.node_over_changed()
+        }
+
+        node.ue_methods_added = true;
+    } catch (e) {
+        Logger.log_error(e);
+    }
+    
+}
 
 /*
 Inject a call to linkRenderController.mark_list_link_outdated into a method with name methodname on all objects in the array
 If object is undefined, do nothing.
 The injection is added at the end of the existing method (if the method didn't exist, it is created).
-A Logger.trace call is added at the start with 'tracetext'
 */
 function inject_outdating_into_objects(array, methodname, tracetext) {
     if (array) {
@@ -28,11 +62,12 @@ function inject_outdating_into_objects(array, methodname, tracetext) {
     }
 }
 function inject_outdating_into_object_method(object, methodname, tracetext) {
-    if (object) inject(object, methodname, tracetext, linkRenderController.mark_link_list_outdated, linkRenderController);
+    if (object) inject(object, methodname, tracetext, shared.linkRenderController.mark_link_list_outdated, shared.linkRenderController);
 }
 
 app.registerExtension({
 	name: "cg.customnodes.use_everywhere",
+    settings: SETTINGS, 
 
     async beforeRegisterNodeDef(nodeType, nodeData, app) {
         /*
@@ -40,118 +75,51 @@ app.registerExtension({
         If it is a UE node, we need to update it as well
         */
         const onConnectionsChange = nodeType.prototype.onConnectionsChange;
-        nodeType.prototype.onConnectionsChange = function (side,slot,connect,link_info,output) {        
-            Logger.trace("onConnectionsChange", arguments, this);
-            if (this.IS_UE && side==1) { // side 1 is input
-                if (this.type=="Anything Everywhere?" && slot!=0) {
-                    // don't do anything for the regexs
-                } else {
-                    const type = (connect && link_info) ? get_real_node(link_info?.origin_id)?.outputs[link_info?.origin_slot]?.type : undefined;
-                    this.input_type[slot] = type;
-                    if (link_info) link_info.type = type ? type : "*";
-                    update_input_label(this, slot, app);
+        nodeType.prototype.onConnectionsChange = function (side,slot,connect,link_info,output) {     
+            if (is_combo_clone(this) && !shared.in_queuePrompt) comboclone_on_connection(this, link_info, connect)
+            if (is_UEnode(this) && side==1) { // side 1 is input
+                input_changed(this, slot, connect, link_info)
+                
+                if (!shared.graph_being_configured) {
+                    // do the fix at the end of graph change
+                    deferred_actions.push( { fn:fix_inputs, args:[this,"deferred onConnectionsChange",]} )
                 }
             }
-            linkRenderController.mark_link_list_outdated();
+            shared.linkRenderController?.mark_link_list_outdated();
             onConnectionsChange?.apply(this, arguments);
         };
 
-        /*
-        Extra menu options are the node right click menu.
-        We add to this list, and also insert a link list outdate to everything.
-        */
-        const getExtraMenuOptions = nodeType.prototype.getExtraMenuOptions;
-        nodeType.prototype.getExtraMenuOptions = function(_, options) {
-            Logger.trace("getExtraMenuOptions", arguments, this);
-            getExtraMenuOptions?.apply(this, arguments);
-            if (is_UEnode(this)) {
-                node_menu_settings(options, this);
-            } else {
-                non_ue_menu_settings(options, this);
+        /* Combo Clone can connect to COMBO or to UE nodes */
+        if (nodeData.name=="Combo Clone") {
+            const onConnectOutput = nodeType.prototype.onConnectOutput
+            nodeType.prototype.onConnectOutput = function(outputIndex, type, input, inputNode, inputIndex) {
+                if  (!(type=="COMBO" || is_UEnode(inputNode))) return false;
+                return onConnectOutput?.apply(this,arguments)
             }
-            inject_outdating_into_objects(options,'callback',`menu option on ${this.id}`);
         }
 
-        /*
-        When a UE node is created, we set the group and color restriction properties.
-        We also create pseudo-widgets for all the inputs so that they can be searched
-        and to avoid other code throwing errors.
-        */
-        if (is_UEnode(nodeType)) {
-            const onNodeCreated = nodeType.prototype.onNodeCreated;
-            nodeType.prototype.onNodeCreated = function () {
-                const r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
-                if (!this.properties) this.properties = {}
-                this.properties.group_restricted = 0;
-                this.properties.color_restricted = 0;
-                if (this.inputs) {
-                    if (!this.widgets) this.widgets = [];
-                    for (const input of this.inputs) {
-                        if (input.widget && !this.widgets.find((w) => w.name === input.widget.name)) this.widgets.push(input.widget)
-                    }
-                }
-                return r;
-            }
-        }
     },
 
-    async nodeCreated(node) {
-        if (!node.__mode) {
-            node.__mode = node.mode
-            defineProperty(node, "mode", {
-                get: ( )=>{return node.__mode},
-                set: (v)=>{node.__mode = v; node.afterChangeMade?.('mode', v);}            
-            })
-        }
-        if (!node.__bgcolor) {
-            node.__bgcolor = node.bgcolor
-            defineProperty(node,"bgcolor", {
-                get: ( )=>{return node.__bgcolor},
-                set: (v)=>{node.__bgcolor = v; node.afterChangeMade?.('bgcolor', v);}                       
-            })
-        }
-        const acm = node.afterChangeMade
-        node.afterChangeMade = (p, v) => {
-            acm?.(p,v)
-            if (p==='bgcolor') {
-                if (node.mode!=4) linkRenderController.mark_link_list_outdated();
-            }
-            if (p==='mode') {
-                linkRenderController.mark_link_list_outdated();
-                node.widgets?.forEach((widget) => {widget.onModeChange?.(v)});
+    async nodeCreated(node) { // the node isn't part of the graph yet, so can't do anything involving id or links.
+        add_methods_to_all_nodes(node)
+
+        if (shared.graph_being_configured) return
+
+        if (is_UEnode(node)) {
+            setup_ue_properties_oncreate(node)
+        } else if (!node.properties.ue_properties) {
+            node.properties.ue_properties = { 
+                widget_ue_connectable : {}, 
+                input_ue_unconnectable : {} 
             }
         }
-
-        node.IS_UE = is_UEnode(node);
-        if (node.IS_UE) {
-            node.input_type = [undefined, undefined, undefined]; // for dynamic input types
-            node.displayMessage = displayMessage;                // receive messages from the python code           
-
-            // If a widget on a UE node is edited, link list is dirty
-            inject_outdating_into_objects(node.widgets,'callback',`widget callback on ${node.id}`);
-
-            // draw the indication of group restrictions
-            const original_onDrawTitleBar = node.onDrawTitleBar;
-            node.onDrawTitleBar = function(ctx, title_height) {
-                original_onDrawTitleBar?.apply(this, arguments);
-                if (node.properties.group_restricted || node.properties.color_restricted) indicate_restriction(ctx, title_height);
-            }
-        }
-
-        if (is_helper(node)) { // editing a helper node makes the list dirty
-            inject_outdating_into_objects(node.widgets,'callback',`widget callback on ${this.id}`);
-        }
-
-        // removing a node makes the list dirty
-        inject_outdating_into_object_method(node, 'onRemoved', `node ${node.id} removed`)
-
-        // creating a node makes the link list dirty - but give the system a moment to finish
-        setTimeout( ()=>{linkRenderController.mark_link_list_outdated()}, 100 );
     }, 
 
-    // When a graph node is loaded collapsed the UI need to know
-    // probably not needed now autocomplete is gone?
-    loadedGraphNode(node) { if (node.flags.collapsed && node.loaded_when_collapsed) node.loaded_when_collapsed(); },
+    // When a graph node is loaded convert it if needed
+    loadedGraphNode(node) { 
+        graphConverter.convert_if_pre_116(node);
+        setup_ue_properties_onload(node)
+    },
 
 	async setup() {
         /*
@@ -178,37 +146,65 @@ app.registerExtension({
         api.addEventListener("ue-message-handler", messageHandler);
 
         api.addEventListener("status", ({detail}) => {
-            if (linkRenderController) linkRenderController.note_queue_size(detail ? detail.exec_info.queue_remaining : 0)
+            if (shared.linkRenderController) shared.linkRenderController.note_queue_size(detail ? detail.exec_info.queue_remaining : 0)
         });
 
-        /*
-        Don't modify the graph when saving the workflow or api
-        */
-        const _original_save_onclick = document.getElementById('comfy-save-button').onclick;
-        document.getElementById('comfy-save-button').onclick = function() {
-            graphAnalyser.pause();
-            _original_save_onclick();
-            graphAnalyser.unpause()
-        }
-        const _original_save_api_onclick = document.getElementById('comfy-dev-save-api-button').onclick;
-        document.getElementById('comfy-dev-save-api-button').onclick = function() {
-            graphAnalyser.pause();
-            // should check for UE links here and give a warning: #217
-            _original_save_api_onclick();
-            graphAnalyser.unpause();
-        }
+        /* if we are on version 1.16 or later, stash input data to convert nodes when they are loaded */
+        //if (graphConverter.running_116_plus()) {
+            const original_loadGraphData = app.loadGraphData;
+            app.loadGraphData = async function (data) {
+                try {
+                    graphConverter.store_node_input_map(data);
+                } catch (e) { Logger.log_error(e); }
+                const cvw_was = settingsCache.getSettingValue("Comfy.Validation.Workflows")
+                if (settingsCache.getSettingValue("Use Everywhere.Options.block_graph_validation")) {
+                    app.ui.settings.setSettingValue("Comfy.Validation.Workflows", false);
+                }
+                await original_loadGraphData.apply(this, arguments);
+                app.ui.settings.setSettingValue("Comfy.Validation.Workflows", cvw_was);
+                //return v;
+            }
+        //}
         
         /* 
         When we draw a node, render the virtual connection points
         */
         const original_drawNode = LGraphCanvas.prototype.drawNode;
         LGraphCanvas.prototype.drawNode = function(node, ctx) {
-            UpdateBlocker.push()
             try {
+                shared.linkRenderController.pause('drawFrontCanvas')
                 const v = original_drawNode.apply(this, arguments);
-                linkRenderController.highlight_ue_connections(node, ctx);
+                shared.linkRenderController.highlight_ue_connections(node, ctx);
+                if (node._last_seen_bg !== node.bgcolor) shared.linkRenderController.mark_link_list_outdated();
+                node._last_seen_bg = node.bgcolor
                 return v
-            } finally { UpdateBlocker.pop() }
+            } catch (e) {
+                Logger.log_error(e)
+            } finally {          
+                shared.linkRenderController.unpause()
+            }
+        }
+
+        /*
+        Before drawing the canvas, temporarily disable all the ue connected widgets  
+        so they get rendered as greyed out.
+        */
+        const original_drawFrontCanvas = LGraphCanvas.prototype.drawFrontCanvas
+        LGraphCanvas.prototype.drawFrontCanvas = function() {
+            var widgets_disabled = []
+            try {
+                widgets_disabled = shared.linkRenderController.disable_all_connected_widgets()
+                return original_drawFrontCanvas.apply(this, arguments);
+            }  catch (e) {
+                Logger.log_error(e)
+            } finally {
+                try {
+                    widgets_disabled.forEach((w)=>w.disabled=false)
+                } catch (e) {
+                    Logger.log_error(e)
+                } 
+                
+            }
         }
 
         /*
@@ -217,17 +213,15 @@ app.registerExtension({
         const drawConnections = LGraphCanvas.prototype.drawConnections;
         LGraphCanvas.prototype.drawConnections = function(ctx) {
             drawConnections?.apply(this, arguments);
-            linkRenderController.render_all_ue_links(ctx);
+            try {
+                shared.linkRenderController.render_all_ue_links(ctx);
+            } catch (e) {
+                Logger.log_error(e)
+            }
         }
-
-        /*
-        Add to the main settings
-        */
-        main_menu_settings();
         
         /* 
-        Canvas menu is the right click on backdrop.
-        We need to add our options, and hijack the others to mark link list dirty
+        Canvas menu is the right click on backdrop.  Add our settings there.
         */
         const original_getCanvasMenuOptions = LGraphCanvas.prototype.getCanvasMenuOptions;
         LGraphCanvas.prototype.getCanvasMenuOptions = function () {
@@ -241,52 +235,131 @@ app.registerExtension({
             return options;
         }
 
+	},
+
+    init() {
+        shared.graphAnalyser        = new GraphAnalyser();
+        shared.linkRenderController = new LinkRenderController();
+
         /*
-        When you drag from a node, showConnectionMenu is called. If shift key is pressed call ours
-        Broken #219
+        Modifications to the graph:
+        - track start and end of the graph being changed
+        - catch convertToSubgraph to try to fix UE links
         */
-        const showSearchBox = LGraphCanvas.prototype.showSearchBox;
-        LGraphCanvas.prototype.showSearchBox = function (optPass) {
-            if (optPass.shiftKey) {
-                autoCreateMenu.apply(this, arguments);
-            } else {
-                this.use_original_menu = true;
-                showSearchBox.apply(this, arguments);
-                this.use_original_menu = false;
+        const original_beforeChange = app.graph.beforeChange
+        app.graph.beforeChange = function () {
+            shared.in_midst_of_change += 1
+            original_beforeChange?.apply(this, arguments)
+        }
+
+        const original_afterChange = app.graph.afterChange
+        app.graph.afterChange = function () {
+            original_afterChange?.apply(this, arguments)
+            shared.in_midst_of_change = Math.max(0, shared.in_midst_of_change-1)  // afterChange gets called without a beforeChange sometimes
+        }
+        
+        const original_subgraph = app.graph.convertToSubgraph
+        app.graph.convertToSubgraph = function () {
+            const ctb_was = shared.graphAnalyser.connect_to_bypassed
+            shared.graphAnalyser.connect_to_bypassed = true
+            try {
+                const cur_list = shared.graphAnalyser.analyse_graph(visible_graph())
+                if (!cur_list) Logger.log_problem('convert to subgraph failed to get ues')
+                const mods = convert_to_links(cur_list, null, visible_graph());
+                const r = original_subgraph.apply(this, arguments);
+                mods.restorer()
+                fix_new_subgraph_node(r.node)
+                return r
+            } finally {
+                shared.graphAnalyser.connect_to_bypassed = ctb_was
             }
         }
 
         /*
-        To allow us to use the shift drag above, we need to intercept 'allow_searchbox' sometimes
-        (because searchbox is the default behaviour when shift dragging)
-        Broken #219
+        Modifications to app
+        - intercept graphToPrompt and queuePrompt so we know where we are
+        - provide API
         */
-        var original_allow_searchbox = app.canvas.allow_searchbox;
-        defineProperty(app.canvas, 'allow_searchbox', {
-            get : function() { 
-                if (this.use_original_menu) { return original_allow_searchbox; }
-                if(app.ui.settings.getSettingValue('AE.replacesearch') && this.connecting_output) {
-                    return false;
-                } else { return original_allow_searchbox; }
-            },
-            set : function(v) { original_allow_searchbox = v; }
-        });
-        
-
-	},
-
-    init() {
-        graphAnalyser = GraphAnalyser.instance();
+        const original_graphToPrompt = app.graphToPrompt;
         app.graphToPrompt = async function () {
-            return graphAnalyser.analyse_graph(true, true, false);
+            try {
+                shared.in_graphToPrompt += 1
+                if (shared.in_queuePrompt || app.ui.settings.getSettingValue("Use Everywhere.Options.always_modify_graph")) {
+                    //Logger.log_shared('In graphToPrompt (going to modify graph):')
+                    return await shared.graphAnalyser.call_function_with_modified_graph( original_graphToPrompt, arguments )
+                } else {
+                    //Logger.log_shared('In graphToPrompt (not going to modify graph):')
+                    return await original_graphToPrompt.apply(this, arguments)
+                }
+            } finally {
+                shared.in_graphToPrompt -= 1
+            }
         }
         
-        linkRenderController = LinkRenderController.instance(graphAnalyser);
+        const original_queuePrompt = app.queuePrompt;
+        app.queuePrompt = async function () {
+            try {
+                shared.in_queuePrompt += 1;
+                return await original_queuePrompt.apply(app, arguments);
+            } finally {
+                shared.in_queuePrompt -= 1;
+            }
+        }
 
-        add_autoprompts();
+        app.ue_modified_prompt = async function () { // API function
+            return await shared.graphAnalyser.call_function_with_modified_graph( original_queuePrompt ) 
+        }
 
-        if (false) add_debug();
+        /*
+        Modifications to the canvas
+        - listen for set-graph to mark the link list as out of date when we open or close a subgraph
+        - catch node-double-click to open the restrictions dialog
+        - onDrawForeground to highlight subgraph output links
+        */
 
+        app.canvas.canvas.addEventListener('litegraph:set-graph', ()=>{
+            shared.linkRenderController.mark_link_list_outdated()
+            setTimeout(()=>{app.canvas.setDirty(true,true)},200)
+        })
+
+        app.canvas.canvas.addEventListener('litegraph:canvas', (e)=>{
+            if (e?.detail?.subType=='node-double-click') {
+                const node = e.detail.node
+                if (node_can_broadcast(node)) {
+                    if (app.ui.settings.getSettingValue('Comfy.Node.DoubleClickTitleToEdit') && e.detail.originalEvent.canvasY<node.pos[1]) return
+                    edit_restrictions(null, null, null, null, node)
+                }
+            }
+        })
+
+        const original_onDrawForeground = app.canvas.onDrawForeground
+        app.canvas.onDrawForeground = function(ctx, visible_area) {
+            if (original_onDrawForeground) original_onDrawForeground.apply(this, arguments)
+            if (this.subgraph) shared.linkRenderController.highlight_subgraph_node_connections.bind(shared.linkRenderController)(this.subgraph, ctx)
+        }
+        
+        /* 
+        Midifications to app.ui.settings
+        - catch changes in language (and read initial value) for i18n
+        */
+        const locale_onChange = app.ui.settings.settingsLookup['Comfy.Locale'].onChange
+        app.ui.settings.settingsLookup['Comfy.Locale'].onChange = function(is_now, was_before) {
+            language_changed(is_now, was_before)
+            return locale_onChange?.apply(this, arguments)
+        }
+        language_changed(app.ui.settings.getSettingValue('Comfy.Locale'), null)
+    },
+
+
+    beforeConfigureGraph() {
+        shared.linkRenderController.pause("before configure", 1000)
+        shared.graphAnalyser.pause("before configure", 1000)
+        shared.graph_being_configured += 1
+    },
+
+    afterConfigureGraph() {
+        shared.graph_being_configured -= 1
+        ue_callbacks.dispatch('afterConfigureGraph')
     }
 
 });

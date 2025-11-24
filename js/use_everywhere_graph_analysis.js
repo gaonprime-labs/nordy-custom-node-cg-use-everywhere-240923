@@ -1,124 +1,133 @@
-import { GroupNodeHandler } from "../core/groupNode.js";
 import { UseEverywhereList } from "./use_everywhere_classes.js";
-import { add_ue_from_node, add_ue_from_node_in_group } from "./use_everywhere_nodes.js";
-import { node_in_loop, node_is_live, is_connected, is_UEnode, Logger, get_real_node } from "./use_everywhere_utilities.js";
+import { node_is_live, is_connected, is_UEnode, Logger, Pausable, node_can_broadcast } from "./use_everywhere_utilities.js";
+import { convert_to_links } from "./use_everywhere_apply.js";
 import { app } from "../../scripts/app.js";
+import { settingsCache } from "./use_everywhere_cache.js";
+import { is_connectable } from "./use_everywhere_settings.js";
+import { for_all_graphs } from "./recursive_callbacks.js";
+import { shared } from "./shared.js";
 
-class GraphAnalyser {
-    static _instance;
-    static instance() {
-        if (!this._instance) this._instance = new GraphAnalyser();
-        return this._instance;
-    }
+class GraphAnalyser extends Pausable {
 
     constructor() {
+        super('GraphAnalyser')
         this.original_graphToPrompt = app.graphToPrompt;
-        this.ambiguity_messages = [];
-        this.pause_depth = 0;
+        this.ambiguities = [];
+        this.latest_ues = null
+        this.mods = []
     }
 
-    pause() { this.pause_depth += 1; }
-    unpause() { this.pause_depth -= 1; }
-
-
-    async analyse_graph(modify_and_return_prompt=false, check_for_loops=false, supress_before_queued=true) {
-        if (this.pause_depth > 0) { return this.original_graphToPrompt.apply(app) }
-        this.ambiguity_messages = [];
-        var p;
-        if (modify_and_return_prompt) {
-            p = await this.original_graphToPrompt.apply(app);
-            try {
-                p = JSON.parse(JSON.stringify(p));
-            } catch (error) {
-                console.error("Error during JSON cloning:", error);
-            }
-        } else {
-            p = { workflow:app.graph.serialize() }
+    modify_graph(graph) {
+        const ues = this.analyse_graph(graph, true)
+        if (ues===null) {
+            Logger.log_problem(`modify_graph called but no ues could be obtained for ${graph.id}`)
+            console.trace()
         }
-                
-        // Create a UseEverywhereList and populate it from all live (not bypassed) nodes
-        const ues = new UseEverywhereList();
-        const live_nodes = p.workflow.nodes.filter((node) => node_is_live(node))
-        live_nodes.filter((node) => is_UEnode(node)).forEach(node => { add_ue_from_node(ues, node); })
-        live_nodes.filter((node) => (get_real_node(node.id, Logger.INFORMATION) && GroupNodeHandler.isGroupNode(get_real_node(node.id)))).forEach( groupNode => {
-            const group_data = GroupNodeHandler.getGroupData(get_real_node(groupNode.id));
-            group_data.nodeData.nodes.filter((node) => is_UEnode(node)).forEach(node => { 
-                add_ue_from_node_in_group(ues, node, groupNode.id, group_data); 
-            })
+        const modifications = convert_to_links( ues, null, graph )
+        this.mods.push( modifications );
+        if (!graph.extra) graph.extra = {}
+        graph.extra['links_added_by_ue'] = modifications.added_links.map(x=>x.id)
+    }
+
+    modify_all_graphs() {
+        for_all_graphs(this.modify_graph.bind(this))
+    }
+
+    async call_function_with_modified_graph( func, args ) {
+        var result
+        this.mods = []
+        try {
+            this.pause('call_function_with_modified_graph')
+            Logger.log_info("Modifying graphs")
+            this.modify_all_graphs()
+            shared.graph_currently_modified += 1
+            result = await (args ? func(...args) : func())
+        } catch (e) {
+            Logger.log_error(e)
+        }
+
+        Logger.log_info("Unmodifying graphs")
+        this.mods.forEach((mod)=>{
+            try {mod.restorer()}
+            catch (e) {Logger.log_error(e)}
         })
+        this.mods = []
+        shared.graph_currently_modified -= 1
+        this.unpause()
+
+        return result
+    }
+
     
-        const links_added = new Set();
-        // Look for unconnected inputs and see if we can connect them
+    clean_slots(links, slots) {
+        slots?.forEach((slot)=>{
+            if (slot.linkIds.find((lid)=>(!links[lid]))) {
+                slot.linkIds = slot.linkIds.filter((lid)=>{ return links[lid] !== undefined })
+            }
+        })
+    }
+
+    analyse_graph(graph, ignore_pause) {
+        if (this.paused() && !ignore_pause) return null
+
+        /* work around known bug in ComfyUI front end that doesn't clean up the linkIds
+        https://github.com/Comfy-Org/ComfyUI_frontend/issues/5673#issuecomment-3314310014
+
+        Fixed? Doesn't seems to be.
+        https://github.com/Comfy-Org/ComfyUI_frontend/pull/6258 */
+        
+
+        this.clean_slots(graph.links, graph.inputNode?.slots)
+        this.clean_slots(graph.links, graph.outputNode?.slots)  
+
+        this.ambiguities = [];
+        const treat_bypassed_as_live = settingsCache.getSettingValue("Use Everywhere.Options.connect_to_bypassed") || this.connect_to_bypassed
+        const live_nodes = graph.nodes.filter((node) => node_is_live(node, treat_bypassed_as_live))
+                
+        // Create a UseEverywhereList and populate it from all live (not bypassed) UE nodes
+        const ues = new UseEverywhereList();
+        live_nodes.filter((node) => node_can_broadcast(node)).filter((node)=>node_is_live(node,false)).forEach(node => { ues.add_ue_from_node(node); })
+
+        // List all unconnected inputs on non-UE nodes which are connectable
+        const connectable = []
         live_nodes.filter((node) => !is_UEnode(node)).forEach(node => {
-            const nd = get_real_node(node.id, Logger.INFORMATION);
-            if (nd && !nd.properties.rejects_ue_links) {
-                var gpData = GroupNodeHandler.getGroupData(nd);
-                const isGrp = !!gpData;
-                const o2n = isGrp ? Object.entries(gpData.oldToNewInputMap) : null;
-                node.inputs?.forEach(input => {
-                    if (!is_connected(input) && !(node.reject_ue_connection && node.reject_ue_connection(input))) {
-                        var ue = ues.find_best_match(node, input, this.ambiguity_messages);
-                        if (ue) {
-                            var effective_node = node;
-                            var effective_node_slot = -1;
-                            if (isGrp) { // the node we are looking at is a group node
-                                const in_index = node.inputs.findIndex((i)=>i==input);
-                                const inner_node_index = o2n.findIndex((l)=>Object.values(l[1]).includes(in_index));
-                                const inner_node_slot_index = Object.values(o2n[inner_node_index][1]).findIndex((l)=>l==in_index);
-                                effective_node_slot = Object.keys(o2n[inner_node_index][1])[inner_node_slot_index];
-                                effective_node = nd.getInnerNodes()[o2n[inner_node_index][0]];
-                            }
-                            const upNode = get_real_node(ue.output[0]);
-                            var effective_output = [ue.output[0], ue.output[1]];
-                            if (GroupNodeHandler.isGroupNode(upNode)) { // the upstream node is a group node
-                                const upGpData = GroupNodeHandler.getGroupData(upNode);
-                                const up_inner_node = upGpData.newToOldOutputMap[ue.output[1]].node;
-                                const up_inner_node_index = up_inner_node.index;
-                                const up_inner_node_id = upNode.getInnerNodes()[up_inner_node_index].id;
-                                const up_inner_node_slot = upGpData.newToOldOutputMap[ue.output[1]].slot;
-                                effective_output = [`${up_inner_node_id}`, up_inner_node_slot];
-                            } 
-                            if (effective_node_slot==-1) effective_node_slot = effective_node.inputs.findIndex((i)=>(i.label ? i.label : i.name)===(input.label ? input.label : input.name));
-                            if (modify_and_return_prompt) p.output[effective_node.id].inputs[effective_node.inputs[effective_node_slot].name] = effective_output;
-                            links_added.add({
-                                "downstream":effective_node.id, "downstream_slot":effective_node_slot,
-                                "upstream":effective_output[0], "upstream_slot":effective_output[1], 
-                                "controller":ue.controller.id,
-                                "type":ue.type
-                            });
-                        }
-                    }
+            if (node && !node.properties.rejects_ue_links) {
+                //if (!real_node._widget_name_map) real_node._widget_name_map =  real_node.widgets?.map(w => w.name) || [];
+                node.inputs?.forEach((input,index) => {
+                    if (!input) return; // NoteNode has input = [undefined,] !
+                    if (is_connected(input, treat_bypassed_as_live, node.graph)) return;  
+                    if (node.reject_ue_connection && node.reject_ue_connection(input)) return;
+                    if (is_connectable(node, input.name)) connectable.push({node, input, index});
+                })
+            }
+        })
+
+        if (graph.outputNode) {
+            graph.outputNode.slots.filter((slot)=>(slot.linkIds.length==0)).forEach((slot,index)=>{
+                connectable.push({node:graph.outputNode, input:slot, index});
+            }
+        )}
+
+        // see if we can connect them
+        const links_added = new Set();
+        connectable.forEach(({node, input, index}) => {
+            var ue = ues.find_best_match(node, input, this.ambiguities);
+            if (ue) {
+                links_added.add({
+                    "downstream":node.id, "downstream_slot":index,
+                    "upstream":ue.output[0], "upstream_slot":ue.output[1], 
+                    "controller":ue.controller.id,
+                    "type":ue.type
                 });
             }
         });
 
-        app.graph.extra['ue_links'] = Array.from(links_added)
+        graph.extra['ue_links'] = Array.from(links_added)
     
-        if (this.ambiguity_messages.length) Logger.log(Logger.PROBLEM, "Ambiguous connections", this.ambiguity_messages, Logger.CAT_AMBIGUITY);
-    
-        // if there are loops report them and raise an exception
-        if (check_for_loops && app.ui.settings.getSettingValue('AE.checkloops')) {
-            try {
-                node_in_loop(live_nodes, links_added);
-            } catch (e) {
-                if (!e.stack) throw e;
-                if (e.ues && e.ues.length > 0){
-                    alert(`Loop (${e.stack}) with broadcast (${e.ues}) - not submitting workflow`);
-                } else {
-                    alert(`Loop (${e.stack}) - not submitting workflow`);
-                }
-                throw new Error(`Loop Detected ${e.stack}, ${e.ues}`, {"cause":e});
-            }
-        }
-    
-        if (modify_and_return_prompt) {
-            [...links_added].forEach((l)=>{
-                p.workflow.last_link_id += 1;
-                p.workflow.links.push([p.workflow.last_link_id, parseInt(l.upstream), l.upstream_slot, l.downstream, l.downstream_slot, l.type])
-            })
-            return p;
-        }
-        else return ues;
+        if (this.ambiguities.length) Logger.log_info("Ambiguous connections", this.ambiguities, true);
+ 
+        this.latest_ues = ues;
+        return this.latest_ues;
     }
 }
 

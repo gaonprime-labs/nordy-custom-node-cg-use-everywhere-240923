@@ -1,86 +1,153 @@
-from server import PromptServer
-import torch
 
-def message(id,message):
-    if isinstance(message, torch.Tensor):
-        string = f"Tensor shape {message.shape}"
-    elif isinstance(message, dict) and "samples" in message and isinstance(message["samples"], torch.Tensor):
-        string = f"Latent shape {message['samples'].shape}"
-    else:
-        string = f"{message}"
-    PromptServer.instance.send_sync("ue-message-handler", {"id": id, "message":string})
+from comfy.comfy_types.node_typing import IO
+from comfy_api.latest import io
 
-class Base():
-    OUTPUT_NODE = True
-    FUNCTION = "func"
-    CATEGORY = "everywhere"
-    RETURN_TYPES = ()
+anything = io.Custom(IO.ANY)
 
-class SimpleString(Base):
-    OUTPUT_NODE = False
+class ComboClone(io.ComfyNode):
     @classmethod
-    def INPUT_TYPES(s):
-        return {"required":{ "string": ("STRING", {"default": ""}) }}
-    RETURN_TYPES = ("STRING",)
+    def define_schema(cls):
+        return io.Schema(
+            node_id  = "Combo Clone",
+            category = "everywhere",
+            display_name = "Combo Clone",
+            description = "The combo on this node will replicate whatever the output is connected to",
+            inputs   = [
+                io.Combo.Input("combo", options=['connect me to a combo widget']),
+            ],
+            outputs = [
+                anything.Output("comboout"),
+            ],
+        )
 
-    def func(self,string):
-        return (string,)
-
-class SeedEverywhere(Base):
     @classmethod
-    def INPUT_TYPES(s):
-        return {"required":{ "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}) },
-                 "hidden": {"id":"UNIQUE_ID"} }
+    def validate_inputs(cls, **kwargs) -> bool:
+        return isinstance(kwargs.get('combo', None),str)
 
-    RETURN_TYPES = ("INT",)
-
-    def func(self, seed, id):
-        message(id, seed)
-        return (seed,)
-
-class AnythingEverywhere(Base):
     @classmethod
-    def INPUT_TYPES(s):
-        return {"required":{}, 
-                "optional": { "anything" : ("*", {}), },
-                 "hidden": {"id":"UNIQUE_ID"} }
+    def execute(cls, combo): # type: ignore
+        return io.NodeOutput(combo)
 
-    def func(self, id, **kwargs):
-        for key in kwargs:
-            message(id, kwargs[key],)
-        return ()
-
-class AnythingEverywherePrompts(Base):
+class SimpleString(io.ComfyNode):
     @classmethod
-    def INPUT_TYPES(s):
-        return {"required":{}, 
-                "optional": { "+ve" : ("*", {}), "-ve" : ("*", {}), } }
+    def define_schema(cls):
+        return io.Schema(
+            node_id  = "Simple String",
+            category = "everywhere/deprecated",
+            display_name = "Simple String",
+            description = "Deprecated - use the core comfy string",
+            is_deprecated = True,
+            inputs   = [
+                io.String.Input("string", default=""),
+            ],
+            outputs = [
+                io.String.Output("stringout"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, string): # type: ignore
+        return io.NodeOutput(string)
+
+class SeedEverywhere(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id  = "Seed Everywhere",
+            category = "everywhere/deprecated",
+            display_name = "Seed Everywhere",
+            description = "Deprecated - should automatically be replaced",
+            is_deprecated = True,
+            inputs   = [
+                io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff),
+            ],
+            outputs = [
+                io.Int.Output("int"),
+            ],
+        )
     
-    def func(self, **kwargs):
-        return ()
-        
-class AnythingEverywhereTriplet(Base):
     @classmethod
-    def INPUT_TYPES(s):
-        return {"required":{}, 
-                "optional": { "anything" : ("*", {}), "anything2" : ("*", {}), "anything3" : ("*", {}),} }
-    
-    def func(self, **kwargs):
-        return ()
-    
-class AnythingSomewhere(Base):
-    @classmethod
-    def INPUT_TYPES(s):
-        return {"required":{}, 
-                "optional": { 
-                    "anything" : ("*", {}), 
-                    "title_regex" : ("STRING", {"default":".*"}),
-                    "input_regex" : ("STRING", {"default":".*"}),
-                    "group_regex" : ("STRING", {"default":".*"}),
-                    },
-                 "hidden": {"id":"UNIQUE_ID"} }
+    def execute(cls, seed): # type: ignore
+        return io.NodeOutput(seed)
 
-    def func(self, id, title_regex=None, input_regex=None, group_regex=None, **kwargs):
-        for key in kwargs:
-            message(id, kwargs[key],)
-        return ()
+class AnythingEverywhere(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id  = "Anything Everywhere",
+            category = "everywhere",
+            display_name = "Anything Everywhere",
+            inputs   = [
+                anything.Input("anything", optional=True),
+            ],
+            outputs = [ ],
+        )
+    
+    @classmethod
+    def execute(cls, **kwargs): 
+        return io.NodeOutput()
+
+class AnythingEverywherePrompts(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id  = "Prompts Everywhere",
+            category = "everywhere/deprecated",
+            display_name = "Anything Everywhere Prompts", 
+            description = "Deprecated - should automatically be replaced",
+            is_deprecated = True,
+            inputs   = [
+                anything.Input("positive", display_name="+ve", optional=True),
+                anything.Input("negative", display_name="-ve", optional=True),
+            ],
+            outputs = [ ],
+        )
+    
+    @classmethod
+    def execute(cls, **kwargs): 
+        return io.NodeOutput()
+
+class AnythingEverywhereTriplet(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id  = "Anything Everywhere3",
+            category = "everywhere/deprecated",
+            display_name = "Anything Everywhere Triplet", 
+            description = "Deprecated - should automatically be replaced",
+            is_deprecated = True,
+            inputs   = [
+                anything.Input("anything", display_name="anything", optional=True),
+                anything.Input("anything2", display_name="anything2", optional=True),
+                anything.Input("anything3", display_name="anything3", optional=True),
+            ],
+            outputs = [ ],
+        )
+    
+    @classmethod
+    def execute(cls, **kwargs): 
+        return io.NodeOutput()
+    
+class AnythingSomewhere(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id  = "Anything Everywhere?",
+            category = "everywhere/deprecated",
+            display_name = "Anything Somewhere", 
+            description = "Deprecated - should automatically be replaced",
+            is_deprecated = True,
+            inputs   = [
+                anything.Input("anything", display_name="anything", optional=True),
+                io.String.Input("title_regex", default="", optional=True),
+                io.String.Input("input_regex", default="", optional=True),
+                io.String.Input("group_regex", default="", optional=True),
+            ],
+            outputs = [ ],
+        )
+    
+    @classmethod
+    def execute(cls, **kwargs): 
+        return io.NodeOutput()
+    
+
