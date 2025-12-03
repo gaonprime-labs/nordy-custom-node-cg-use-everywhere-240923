@@ -153,7 +153,7 @@ class GraphConverter {
             }
         }
         // fix the localized names
-        node.inputs = node.inputs.forEach((input) => {
+        node.inputs.forEach((input) => {
             if (input) {
                 if (!input.localized_name || input.localized_name.startsWith(i18n('anything'))) input.localized_name = input.name
             } else {
